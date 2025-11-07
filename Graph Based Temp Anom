@@ -1,0 +1,299 @@
+# ===== deps =====
+# pip install kagglehub[pandas-datasets] pandas numpy scikit-learn networkx python-dateutil tldextract matplotlib
+
+import re
+import io
+import gc
+import numpy as np
+import pandas as pd
+import networkx as nx
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import StandardScaler
+from dateutil import tz
+from email import message_from_string
+from email.utils import parsedate_to_datetime
+import tldextract
+import matplotlib.pyplot as plt
+
+# ===== load kaggle =====
+# dataset: wcukierski/enron-email-dataset
+import kagglehub
+from kagglehub import KaggleDatasetAdapter
+
+FILE_PATH = "emails.csv"  # adjust if needed
+
+df_raw = kagglehub.load_dataset(
+    KaggleDatasetAdapter.PANDAS,
+    "wcukierski/enron-email-dataset",
+    FILE_PATH,
+)
+
+print("raw shape:", df_raw.shape)
+
+# ===== helpers =====
+def parse_addresses(header_val: str):
+    # split emails
+    if not header_val:
+        return []
+    parts = re.split(r'[;,]', header_val)
+    addrs = []
+    for p in parts:
+        m = re.search(r'[\w\.\-\+%]+@[\w\.\-]+', p or "")
+        if m:
+            addrs.append(m.group(0).lower().strip())
+    return list(dict.fromkeys(addrs))
+
+def enron_domain(addr: str) -> bool:
+    # domain check
+    if not addr or "@" not in addr:
+        return False
+    ext = tldextract.extract(addr)
+    dom = ".".join([d for d in [ext.domain, ext.suffix] if d])
+    return dom.endswith("enron.com")
+
+def utc_ts(dtobj):
+    # to utc
+    if dtobj is None:
+        return None
+    if dtobj.tzinfo is None:
+        return dtobj.replace(tzinfo=tz.UTC)
+    return dtobj.astimezone(tz.UTC)
+
+# ===== parse raw =====
+if "message" not in df_raw.columns:
+    raise ValueError("Expected column 'message' not found.")
+
+def fast_parse(row_msg: str):
+    # minimal parse
+    try:
+        em = message_from_string(row_msg or "")
+        dt = parsedate_to_datetime(em.get("Date")) if em.get("Date") else None
+        dt = utc_ts(dt)
+        sender = parse_addresses(em.get("From"))[:1]
+        to_ = parse_addresses(em.get("To"))
+        cc_ = parse_addresses(em.get("Cc"))
+        bcc_ = parse_addresses(em.get("Bcc"))
+        subj = (em.get("Subject") or "").strip()
+        return pd.Series({
+            "sent_ts": dt,
+            "from_addr": sender[0] if sender else None,
+            "to_list": to_,
+            "cc_list": cc_,
+            "bcc_list": bcc_,
+            "subject": subj,
+        })
+    except Exception:
+        return pd.Series({
+            "sent_ts": None, "from_addr": None,
+            "to_list": [], "cc_list": [], "bcc_list": [], "subject": None
+        })
+
+df_parsed = df_raw["message"].apply(fast_parse)
+df = pd.concat([df_raw.drop(columns=["message"]), df_parsed], axis=1)
+df = df.dropna(subset=["sent_ts", "from_addr"]).reset_index(drop=True)
+print("parsed shape:", df.shape)
+
+# ===== explode edges =====
+def explode_edges(df):
+    # build src->dst
+    recips = []
+    for idx, r in df.iterrows():
+        full_list = (r["to_list"] or []) + (r["cc_list"] or [])
+        for dst in full_list:
+            recips.append((r["from_addr"], dst, r["sent_ts"]))
+    if not recips:
+        return pd.DataFrame(columns=["src","dst","sent_ts"])
+    e = pd.DataFrame(recips, columns=["src","dst","sent_ts"])
+    e = e[e["src"] != e["dst"]]
+    return e
+
+edges = explode_edges(df)
+edges = edges.sort_values("sent_ts").reset_index(drop=True)
+print("edges:", edges.shape)
+
+# ===== alias =====
+edges["src_id"] = edges["src"].str.lower()
+edges["dst_id"] = edges["dst"].str.lower()
+
+# ===== time bins =====
+edges["week_start"] = edges["sent_ts"].dt.to_period("W-MON").dt.start_time
+
+# ===== features per week =====
+def weekly_features(e_week: pd.DataFrame):
+    # graph
+    G = nx.DiGraph()
+    G.add_edges_from(e_week[["src_id","dst_id"]].itertuples(index=False, name=None))
+
+    # deg
+    out_deg = dict(G.out_degree())
+    in_deg = dict(G.in_degree())
+
+    # clustering
+    UG = G.to_undirected()
+    clustering = nx.clustering(UG)
+
+    # after-hours
+    aw = e_week.copy()
+    aw["hour"] = aw["sent_ts"].dt.hour
+    aw["is_after"] = ~aw["hour"].between(9, 17)
+
+    # partner stats
+    sent_cnt = e_week.groupby("src_id").size().rename("emails_sent")
+    recv_cnt = e_week.groupby("dst_id").size().rename("emails_recv")
+    partners = e_week.groupby("src_id")["dst_id"].nunique().rename("unique_partners")
+    after_ratio = aw.groupby("src_id")["is_after"].mean().rename("after_hours_ratio")
+
+    # external ratio
+    e_week["src_enron"] = e_week["src_id"].apply(enron_domain)
+    e_week["dst_enron"] = e_week["dst_id"].apply(enron_domain)
+    ext_ratio = (
+        e_week.groupby("src_id")
+        .apply(lambda x: (x["dst_enron"] == False).mean())
+        .rename("external_ratio")
+    )
+
+    # combine
+    feats = pd.DataFrame({
+        "emails_sent": sent_cnt,
+        "emails_recv": recv_cnt,
+        "unique_partners": partners,
+        "after_hours_ratio": after_ratio,
+        "external_ratio": ext_ratio,
+    }).fillna(0.0)
+
+    feats["out_deg"] = feats.index.map(lambda k: out_deg.get(k, 0)).astype(float)
+    feats["in_deg"]  = feats.index.map(lambda k: in_deg.get(k, 0)).astype(float)
+    feats["clustering"] = feats.index.map(lambda k: clustering.get(k, 0.0)).astype(float)
+
+    feats = feats.reset_index().rename(columns={"index":"person_id"})
+    return feats
+
+# compute
+weekly_frames = []
+for wk, grp in edges.groupby("week_start", sort=True):
+    if grp.shape[0] < 5:
+        continue
+    f = weekly_features(grp)
+    f["week_start"] = wk
+    weekly_frames.append(f)
+
+features_week = pd.concat(weekly_frames, ignore_index=True) if weekly_frames else pd.DataFrame(
+    columns=["person_id","week_start","emails_sent","emails_recv","unique_partners",
+             "after_hours_ratio","external_ratio","out_deg","in_deg","clustering"]
+)
+print("features_week:", features_week.shape)
+
+# ===== anomaly =====
+feat_cols = [
+    "emails_sent","emails_recv","unique_partners",
+    "after_hours_ratio","external_ratio",
+    "out_deg","in_deg","clustering"
+]
+features_week = features_week.dropna(subset=feat_cols).reset_index(drop=True)
+
+scaler = StandardScaler()
+X = scaler.fit_transform(features_week[feat_cols].values)
+
+iso = IsolationForest(
+    n_estimators=300,
+    contamination="auto",
+    random_state=42,
+    n_jobs=-1,
+)
+iso.fit(X)
+scores = -iso.decision_function(X)
+
+features_week["anomaly_score"] = scores
+features_week["anomaly_flag"] = iso.predict(X) == -1
+
+# ===== outputs =====
+# table head
+out_cols = ["person_id","week_start","anomaly_score","anomaly_flag"] + feat_cols
+print("\n=== top anomalies ===")
+print(features_week.sort_values("anomaly_score", ascending=False)[out_cols].head(20))
+
+# save csv
+features_week.sort_values(["week_start","anomaly_score"], ascending=[True,False]).to_csv(
+    "features_person_week_with_scores.csv", index=False
+)
+print("\nsaved: features_person_week_with_scores.csv")
+
+# ===== plots =====
+# 1) score dist
+plt.figure()
+plt.hist(features_week["anomaly_score"].values, bins=50)
+plt.title("Anomaly Score Distribution")
+plt.xlabel("score")
+plt.ylabel("count")
+plt.tight_layout()
+plt.show()
+
+# 2) weekly mean score
+plt.figure()
+weekly_mean = (features_week.groupby("week_start")["anomaly_score"].mean()
+               .sort_index())
+plt.plot(weekly_mean.index, weekly_mean.values)
+plt.title("Weekly Mean Anomaly Score")
+plt.xlabel("week")
+plt.ylabel("mean score")
+plt.tight_layout()
+plt.show()
+
+# 3) scatter deg vs score
+plt.figure()
+plt.scatter(features_week["out_deg"].values, features_week["anomaly_score"].values, s=10)
+plt.title("Out-Degree vs Anomaly")
+plt.xlabel("out_deg")
+plt.ylabel("score")
+plt.tight_layout()
+plt.show()
+
+# 4) top week subgraph (optional)
+top_row = features_week.sort_values("anomaly_score", ascending=False).head(1)
+if not top_row.empty:
+    wk = top_row.iloc[0]["week_start"]
+    g = edges[edges["week_start"] == wk]
+    # small cut
+    senders = (
+        g.groupby("src_id").size().sort_values(ascending=False).head(30).index.tolist()
+    )
+    cut = g[g["src_id"].isin(senders)]
+    G = nx.DiGraph()
+    G.add_edges_from(cut[["src_id","dst_id"]].itertuples(index=False, name=None))
+    plt.figure()
+    pos = nx.spring_layout(G, seed=42)
+    nx.draw_networkx_nodes(G, pos, node_size=50)
+    nx.draw_networkx_edges(G, pos, arrows=False, width=0.5)
+    # labels optional
+    # nx.draw_networkx_labels(G, pos, font_size=6)
+    plt.title(f"Subgraph Top Week: {wk.date()}")
+    plt.axis("off")
+    plt.tight_layout()
+    plt.show()
+
+# ===== crossref trades (commented) =====
+# # load trades
+# trades = pd.read_parquet("data/market/trades.parquet")
+# # join window
+# join = pd.merge_asof(
+#     trades.sort_values("trade_ts"),
+#     features_week.sort_values("week_start"),
+#     left_on="trade_ts",
+#     right_on="week_start",
+#     left_by="trader_person_id",
+#     right_by="person_id",
+#     direction="backward",
+#     tolerance=pd.Timedelta("7D"),
+# )
+# # plot trade lift
+# plt.figure()
+# grp = join.groupby("week_start")["anomaly_score"].mean()
+# plt.plot(grp.index, grp.values)
+# plt.title("Trades vs Anomaly (Mean)")
+# plt.xlabel("week")
+# plt.ylabel("mean score")
+# plt.tight_layout()
+# plt.show()
+
+# ===== done =====
+gc.collect()
