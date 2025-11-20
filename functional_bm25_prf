@@ -1,0 +1,440 @@
+"""
+BM25 + Domain Lexicon with Pseudo-Relevance Feedback (PRF)
+Enhanced for California Electricity Market Manipulation Detection (2000-2001)
+"""
+
+import math
+import re
+import pandas as pd
+import numpy as np
+from email import message_from_string
+from email.utils import parsedate_to_datetime
+from dateutil import tz
+import kagglehub
+from kagglehub import KaggleDatasetAdapter
+from collections import defaultdict
+import hashlib
+
+# ===== Configuration =====
+STOPWORDS = {
+    'a','an','the','and','or','but','if','while','for','to','of','in','on','at','by','from',
+    'as','is','are','was','were','be','been','being','it','its','this','that','these','those',
+    'with','we','you','he','she','they','them','his','her','their','our','us','i','me','my','mine',
+    'your','yours','ours','do','does','did','doing','have','has','had','having','will','would',
+    'can','could','should','shall','may','might','must','not','no','yes','so','such','than','then'
+}
+
+# Enhanced lexicon prioritizing manipulation-specific terms
+MANIPULATION_LEXICON = {
+    # Known manipulation strategies (CRITICAL)
+    'death', 'star', 'fat', 'boy', 'ricochet', 'get', 'shorty',
+    'load', 'shift', 'inc', 'dec', 'megawatt', 'laundering',
+    
+    # Manipulation indicators (HIGH PRIORITY)
+    'gaming', 'scheme', 'strategy', 'exploit', 'artificial',
+    'overschedule', 'phantom', 'circular', 'wash', 'trade',
+    
+    # Secrecy/internal indicators
+    'confidential', 'internal', 'sensitive', 'destroy', 'delete',
+    
+    # California crisis specifics
+    'california', 'caiso', 'calpx', 'caliso', 'pge', 'edison',
+    'socal', 'stage', 'emergency', 'blackout', 'rolling',
+    
+    # Market manipulation terms
+    'congestion', 'constrain', 'constraint', 'transmission',
+    'scheduling', 'schedule', 'bid', 'bidding', 'ancillary',
+    'balancing', 'settlement', 'export', 'import', 'wheeling',
+    
+    # Financial terms
+    'overcharge', 'price', 'cap', 'spike', 'profit', 'margin',
+    'revenue', 'payment', 'charge', 'cost',
+    
+    # Technical terms (lower weight)
+    'outage', 'reserve', 'capacity', 'load', 'power', 'energy',
+    'market', 'trading', 'real', 'time', 'day', 'ahead',
+}
+
+# Multi-word patterns for manipulation strategies
+MANIPULATION_PHRASES = {
+    'death star': 10.0,
+    'fat boy': 10.0,
+    'get shorty': 10.0,
+    'load shift': 8.0,
+    'inc dec': 8.0,
+    'wash trade': 8.0,
+    'circular scheduling': 8.0,
+    'phantom scheduling': 8.0,
+    'artificial congestion': 9.0,
+    'gaming strategy': 7.0,
+    'price spike': 5.0,
+    'stage 3': 6.0,
+    'rolling blackout': 6.0,
+    'confidential strategy': 8.0,
+    'internal only': 6.0,
+}
+
+TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
+
+# Peak manipulation period
+MANIPULATION_START = pd.Timestamp('2000-12-01', tz='UTC')
+MANIPULATION_END = pd.Timestamp('2001-06-30', tz='UTC')
+
+# ===== Helper Functions =====
+def tokenize(text: str):
+    """Tokenize and filter text"""
+    if not isinstance(text, str):
+        return []
+    toks = [t.lower() for t in TOKEN_RE.findall(text)]
+    return [t for t in toks if t not in STOPWORDS and len(t) > 1]
+
+def utc_ts(dtobj):
+    """Convert to UTC timestamp"""
+    if dtobj is None:
+        return None
+    if dtobj.tzinfo is None:
+        return dtobj.replace(tzinfo=tz.UTC)
+    return dtobj.astimezone(tz.UTC)
+
+def parse_email_fast(row_msg: str):
+    """Parse email message efficiently"""
+    try:
+        em = message_from_string(row_msg or "")
+        dt = parsedate_to_datetime(em.get("Date")) if em.get("Date") else None
+        dt = utc_ts(dt)
+        
+        body = ""
+        if em.is_multipart():
+            for part in em.walk():
+                if part.get_content_type() == "text/plain":
+                    try:
+                        body = part.get_payload(decode=True).decode('utf-8', errors='ignore')
+                        break
+                    except:
+                        pass
+        else:
+            try:
+                body = em.get_payload(decode=True).decode('utf-8', errors='ignore')
+            except:
+                body = str(em.get_payload())
+        
+        return pd.Series({
+            "email_ts": dt,
+            "from": em.get("From", ""),
+            "to": em.get("To", ""),
+            "subject": (em.get("Subject") or "").strip(),
+            "body": body.strip()
+        })
+    except Exception as e:
+        return pd.Series({
+            "email_ts": None, "from": None, "to": None, "subject": None, "body": None
+        })
+
+def get_content_hash(subject, body):
+    """Generate hash for deduplication"""
+    content = f"{subject}|{body}"
+    return hashlib.md5(content.encode('utf-8')).hexdigest()
+
+def calculate_phrase_score(text: str) -> float:
+    """Calculate bonus score for manipulation phrases"""
+    text_lower = text.lower()
+    score = 0.0
+    for phrase, weight in MANIPULATION_PHRASES.items():
+        if phrase in text_lower:
+            score += weight
+    return score
+
+def calculate_temporal_score(email_ts: pd.Timestamp) -> float:
+    """
+    Calculate temporal relevance score
+    Peak manipulation: Dec 2000 - June 2001
+    """
+    if pd.isna(email_ts):
+        return 0.1
+    
+    # Peak period: full weight
+    if MANIPULATION_START <= email_ts <= MANIPULATION_END:
+        # Extra boost for Jan-May 2001 (crisis peak)
+        if pd.Timestamp('2001-01-01', tz='UTC') <= email_ts <= pd.Timestamp('2001-05-31', tz='UTC'):
+            return 2.0
+        return 1.5
+    
+    # Shoulder periods: partial weight
+    elif pd.Timestamp('2000-06-01', tz='UTC') <= email_ts < MANIPULATION_START:
+        return 0.8  # Build-up period
+    elif MANIPULATION_END < email_ts <= pd.Timestamp('2001-09-30', tz='UTC'):
+        return 0.6  # Aftermath period
+    
+    # Outside manipulation period: low weight
+    return 0.2
+
+# ===== BM25 Implementation =====
+class BM25Index:
+    def __init__(self, docs, doc_lens, avgdl, df, idf, k1=1.5, b=0.75):
+        self.docs = docs
+        self.doc_lens = doc_lens
+        self.avgdl = avgdl
+        self.df = df
+        self.idf = idf
+        self.k1 = k1
+        self.b = b
+
+    def score(self, query_terms, doc_id):
+        tf = {}
+        for t in self.docs[doc_id]:
+            tf[t] = tf.get(t, 0) + 1
+        score = 0.0
+        dl = self.doc_lens[doc_id]
+        for t in query_terms:
+            if t not in self.idf:
+                continue
+            f = tf.get(t, 0)
+            if f == 0:
+                continue
+            idf = self.idf[t]
+            denom = f + self.k1*(1 - self.b + self.b*dl/self.avgdl)
+            score += idf * (f*(self.k1+1))/denom
+        return score
+
+def build_bm25(corpus_tokens, k1=1.5, b=0.75):
+    """Build BM25 index from tokenized corpus"""
+    N = len(corpus_tokens)
+    df = {}
+    doc_lens = np.array([len(d) for d in corpus_tokens], dtype=float)
+    avgdl = float(doc_lens.mean()) if N > 0 else 0.0
+    
+    for d in corpus_tokens:
+        seen = set()
+        for t in d:
+            if t in seen:
+                continue
+            df[t] = df.get(t, 0) + 1
+            seen.add(t)
+    
+    idf = {}
+    for t, df_t in df.items():
+        idf[t] = math.log((N - df_t + 0.5) / (df_t + 0.5) + 1e-12)
+    
+    return BM25Index(
+        docs=corpus_tokens, doc_lens=doc_lens, avgdl=avgdl, df=df, idf=idf, k1=k1, b=b
+    )
+
+# ===== PRF Functions =====
+def top_terms_from_docs(corpus_tokens, doc_ids, top_n=10, exclude=None):
+    """Extract top terms from top-ranked documents"""
+    exclude = set(exclude or [])
+    counts = {}
+    for d in doc_ids:
+        for t in corpus_tokens[d]:
+            if t in exclude or t in STOPWORDS:
+                continue
+            counts[t] = counts.get(t, 0) + 1
+    ranked = sorted(counts.items(), key=lambda x: (-x[1], x[0]))
+    return [t for t, _ in ranked[:top_n]]
+
+def expand_query_with_prf(bm25, corpus_tokens, init_query_terms, top_k=10, expand_n=20):
+    """Expand query using Pseudo-Relevance Feedback"""
+    scores = [bm25.score(init_query_terms, i) for i in range(len(corpus_tokens))]
+    top_doc_ids = list(np.argsort(scores)[::-1][:top_k])
+    expansion = top_terms_from_docs(corpus_tokens, top_doc_ids, top_n=expand_n, exclude=init_query_terms)
+    expanded_query = list(dict.fromkeys(init_query_terms + expansion))
+    return expanded_query, scores, top_doc_ids
+
+# ===== Main Processing =====
+def load_and_process_enron():
+    """Load full Enron dataset from Kaggle"""
+    print("Loading Enron dataset from Kaggle...")
+    df_raw = kagglehub.load_dataset(
+        KaggleDatasetAdapter.PANDAS,
+        "wcukierski/enron-email-dataset",
+        "emails.csv",
+    )
+    print(f"Raw dataset shape: {df_raw.shape}")
+    
+    # Parse emails
+    print("Parsing emails...")
+    df_parsed = df_raw["message"].apply(parse_email_fast)
+    df = pd.concat([df_raw[["file"]], df_parsed], axis=1)
+    
+    df = df.dropna(subset=["email_ts", "subject"]).reset_index(drop=True)
+    
+    df["year"] = df["email_ts"].dt.year
+    df = df[df["year"].isin([2000, 2001])].reset_index(drop=True)
+    
+    print(f"Filtered to 2000-2001: {len(df)} emails")
+    
+    print("Deduplicating emails...")
+    df['content_hash'] = df.apply(lambda x: get_content_hash(x['subject'], x['body']), axis=1)
+    
+    df_dedup = df.drop_duplicates(subset=['content_hash'], keep='first').reset_index(drop=True)
+    print(f"After deduplication: {len(df_dedup)} unique emails")
+    
+    df_dedup.insert(0, "email_id", [f"<enron_{i}>" for i in range(len(df_dedup))])
+    
+    return df_dedup
+
+def build_corpus(df: pd.DataFrame):
+    """Build tokenized corpus from emails"""
+    texts = (df['subject'].fillna('') + ' ' + df['body'].fillna('')).tolist()
+    return [tokenize(t) for t in texts]
+
+def bm25_with_prf_enhanced(df: pd.DataFrame, seed_terms, top_k=15, expand_n=25, k1=1.5, b=0.75):
+    """Run BM25 with PRF with manipulation-specific enhancements"""
+    print("\nBuilding corpus tokens...")
+    corpus_tokens = build_corpus(df)
+    
+    print("Building BM25 index...")
+    index = build_bm25(corpus_tokens, k1=k1, b=b)
+    
+    print(f"Running initial BM25 ranking with {len(seed_terms)} seed terms...")
+    init_scores = [index.score(seed_terms, i) for i in range(len(corpus_tokens))]
+    
+    print(f"Expanding query with PRF (top_k={top_k}, expand_n={expand_n})...")
+    expanded_query, _, top_doc_ids = expand_query_with_prf(
+        index, corpus_tokens, seed_terms, top_k=top_k, expand_n=expand_n
+    )
+    
+    print(f"Re-ranking with expanded query ({len(expanded_query)} terms)...")
+    final_scores = [index.score(expanded_query, i) for i in range(len(corpus_tokens))]
+    
+    final = df.copy()
+    final['bm25_score_raw'] = final_scores
+    final['rank_before_prf'] = pd.Series(init_scores).rank(ascending=False, method='min').astype(int)
+    
+    print("Calculating manipulation-specific features...")
+    
+    final['phrase_score'] = final.apply(
+        lambda x: calculate_phrase_score(f"{x['subject']} {x['body']}"), axis=1
+    )
+    
+    final['temporal_score'] = final['email_ts'].apply(calculate_temporal_score)
+    
+    def _lex_hits(row):
+        txt = f"{row.get('subject','')} {row.get('body','')}".lower()
+        return sum(1 for w in MANIPULATION_LEXICON if w in txt)
+    
+    final['lexicon_hits'] = final.apply(_lex_hits, axis=1)
+    
+    def _ca_score(row):
+        txt = f"{row.get('subject','')} {row.get('body','')}".lower()
+        ca_terms = ['california', 'caiso', 'calpx', 'pge', 'edison', 'socal']
+        return sum(2.0 for term in ca_terms if term in txt)
+    
+    final['ca_score'] = final.apply(_ca_score, axis=1)
+    
+    def _secrecy_score(row):
+        txt = f"{row.get('subject','')} {row.get('body','')}".lower()
+        secrecy_terms = ['confidential', 'internal', 'sensitive', 'destroy', 'delete', 'don\'t share']
+        return sum(3.0 for term in secrecy_terms if term in txt)
+    
+    final['secrecy_score'] = final.apply(_secrecy_score, axis=1)
+    
+    final['bm25_score'] = (
+        final['bm25_score_raw'] * final['temporal_score'] +
+        final['phrase_score'] * 5.0 +
+        final['ca_score'] * 2.0 +
+        final['secrecy_score'] * 1.5 +
+        final['lexicon_hits'] * 0.5
+    )
+    
+    final['rank_after_prf'] = final['bm25_score'].rank(ascending=False, method='min').astype(int)
+    
+    bm25_vals = final['bm25_score'].astype(float).values
+    bm25_min, bm25_max = float(np.min(bm25_vals)), float(np.max(bm25_vals))
+    rng = bm25_max - bm25_min if bm25_max > bm25_min else 1.0
+    final['text_score'] = (final['bm25_score'] - bm25_min) / rng
+    
+    final = final.sort_values('bm25_score', ascending=False).reset_index(drop=True)
+    
+    return {
+        'expanded_query': expanded_query,
+        'top_doc_ids': top_doc_ids,
+        'final_ranking': final
+    }
+
+# ===== Main Execution =====
+if __name__ == "__main__":
+    enron_df = load_and_process_enron()
+    
+    seed_terms = sorted(MANIPULATION_LEXICON)
+    print(f"\nUsing {len(seed_terms)} seed terms from manipulation lexicon")
+    print(f"Sample terms: {seed_terms[:15]}")
+    
+    results = bm25_with_prf_enhanced(
+        enron_df, 
+        seed_terms, 
+        top_k=15,      # Use top 15 docs for PRF
+        expand_n=25,   # Add 25 expansion terms
+        k1=1.5, 
+        b=0.75
+    )
+    
+    print(f"\n{'='*80}")
+    print("EXPANDED QUERY TERMS:")
+    print(f"{'='*80}")
+    print(f"Original: {len(seed_terms)} terms")
+    print(f"Expanded: {len(results['expanded_query'])} terms")
+    new_terms = set(results['expanded_query']) - set(seed_terms)
+    print(f"New terms added ({len(new_terms)}): {sorted(list(new_terms))[:20]}")
+    
+    # Get top 5 results
+    top_5 = results['final_ranking'].head(5)
+    
+    print(f"\n{'='*80}")
+    print("TOP 5 EMAILS FOR ELECTRICITY MARKET MANIPULATION")
+    print(f"{'='*80}\n")
+    
+    for idx, row in top_5.iterrows():
+        print(f"RANK #{idx+1}")
+        print(f"  Email ID: {row['email_id']}")
+        print(f"  Date: {row['email_ts']}")
+        print(f"  From: {row['from']}")
+        print(f"  To: {row['to'][:100]}...")  # Truncate long recipient lists
+        print(f"  Subject: {row['subject']}")
+        print(f"\n  SCORES:")
+        print(f"    Final BM25 Score: {row['bm25_score']:.2f}")
+        print(f"    Text Score (normalized): {row['text_score']:.4f}")
+        print(f"    Raw BM25: {row['bm25_score_raw']:.2f}")
+        print(f"    Temporal Score: {row['temporal_score']:.2f}")
+        print(f"    Phrase Score: {row['phrase_score']:.2f}")
+        print(f"    California Score: {row['ca_score']:.2f}")
+        print(f"    Secrecy Score: {row['secrecy_score']:.2f}")
+        print(f"    Lexicon Hits: {row['lexicon_hits']}")
+        print(f"    Rank Before PRF: {row['rank_before_prf']}")
+        print(f"    Rank After PRF: {row['rank_after_prf']}")
+        print(f"\n  Body Preview (first 400 chars):")
+        body_preview = row['body'][:400] if pd.notna(row['body']) else ""
+        print(f"  {body_preview}...")
+        print(f"\n{'-'*80}\n")
+    
+
+    print(f"\n{'='*80}")
+    print("SUMMARY STATISTICS")
+    print(f"{'='*80}")
+    peak_period = results['final_ranking'][
+        (results['final_ranking']['email_ts'] >= MANIPULATION_START) &
+        (results['final_ranking']['email_ts'] <= MANIPULATION_END)
+    ]
+    print(f"Emails in peak manipulation period (Dec 2000 - Jun 2001): {len(peak_period)}")
+    print(f"Top 100 emails in peak period: {len(results['final_ranking'].head(100).merge(peak_period, on='email_id'))}")
+    print(f"Average phrase score in top 100: {results['final_ranking'].head(100)['phrase_score'].mean():.2f}")
+    print(f"Average CA score in top 100: {results['final_ranking'].head(100)['ca_score'].mean():.2f}")
+    
+
+    print(f"\n{'='*80}")
+    print("SAVING RESULTS")
+    print(f"{'='*80}")
+    
+
+    results['final_ranking'].head(5).to_csv("top_5_manipulation_emails.csv", index=False)
+    
+    text_scores = results['final_ranking'][
+        ['email_id', 'email_ts', 'text_score', 'bm25_score', 'bm25_score_raw',
+         'phrase_score', 'temporal_score', 'ca_score', 'secrecy_score', 'lexicon_hits']
+    ].copy()
+    text_scores.to_csv("text_scores_full.csv", index=False)
+    
+    print("\nFiles saved:")
+    print("  - top_5_manipulation_emails.csv")
+    print("  - text_scores_full.csv")
+    print("\nDone!")
